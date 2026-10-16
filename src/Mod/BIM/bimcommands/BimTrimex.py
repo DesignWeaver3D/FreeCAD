@@ -7,6 +7,7 @@ import FreeCAD as App
 import FreeCADGui as Gui
 from draftguitools.gui_trimex import Trimex
 from draftutils import utils
+from draftutils.translate import translate
 
 
 class BimTrimex(Trimex):
@@ -131,13 +132,24 @@ class BimTrimex(Trimex):
         axis.normalize()
         start = placement.multVec(base_placement.Base)
         points = [start, start + axis * length]
-        if obj.IfcType in ("Beam", "Column") and obj.Length.Value > obj.Height.Value:
+        beam_or_column = obj.IfcType in ("Beam", "Column")
+        if beam_or_column and obj.Length.Value > obj.Height.Value:
             prop = "Length"
         else:
             prop = "Height"
 
         def set_structure(new_points):
             length = new_points[1].sub(new_points[0]).dot(axis)
+            # a Beam or Column is built lying down when its Length is greater
+            # than its Height, so the edit must not change which one is greater
+            if beam_or_column and prop == "Length" and length <= obj.Height.Value:
+                msg = translate("BIM", "Trimex: Length must be greater than Height ({})")
+                App.Console.PrintWarning(msg.format(obj.Height.UserString) + "\n")
+                return
+            if beam_or_column and prop == "Height" and length < obj.Length.Value:
+                msg = translate("BIM", "Trimex: Height cannot be less than Length ({})")
+                App.Console.PrintWarning(msg.format(obj.Length.UserString) + "\n")
+                return
             if length > 0:
                 obj.Placement.Base = obj.Placement.Base + axis * new_points[0].sub(points[0]).dot(
                     axis
