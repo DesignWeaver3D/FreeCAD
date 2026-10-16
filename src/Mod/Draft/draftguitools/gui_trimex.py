@@ -47,7 +47,7 @@ from draftguitools import gui_trackers as trackers
 from draftutils import gui_utils
 from draftutils import params
 from draftutils import utils
-from draftutils.messages import _msg, _err, _toolmsg
+from draftutils.messages import _msg, _err, _toolmsg, _wrn
 from draftutils.translate import translate
 
 
@@ -104,6 +104,8 @@ class Trimex(gui_base_original.Modifier):
         self.width = None
         self.axisSetter = None
         self.axisEndpoints = None
+        self.axisDirections = None
+        self.axisParallelFace = False
         self.lockedActivePoint = None
         self.extrudeMode = False
         self.extrudeBase = None
@@ -184,6 +186,7 @@ class Trimex(gui_base_original.Modifier):
         self.shift = False
         self.alt = False
         self.force = None
+        self.snapped = None
         self.cv = None
         self.call = self.view.addEventCallback("SoEvent", self.action)
         _toolmsg(translate("draft", "Pick distance"))
@@ -233,6 +236,7 @@ class Trimex(gui_base_original.Modifier):
 
         self.axisSetter = setter
         self.axisEndpoints = points
+        self.axisDirections = axes
         self.lockedActivePoint = end
         span = points[0].distanceToPoint(points[1])
         inner = points[end] - axes[end] * span
@@ -258,6 +262,45 @@ class Trimex(gui_base_original.Modifier):
             if aligned and on_face:
                 return i
         return None
+
+    def _getAxisTarget(self, point, info):
+        """Return the point the axis end should move to, or None."""
+        import Part
+
+        self.axisParallelFace = False
+        if not info:
+            return None
+        parent = info.get("ParentObject", None)
+        if parent:
+            subname = info["SubName"]
+            target = parent.getSubObject(subname, retType=1)
+        else:
+            parent = self.doc.getObject(info["Object"])
+            subname = info["Component"]
+            target = parent
+        if parent is None:
+            return None
+        shape = _get_global_shape(parent, subname)
+        if shape.ShapeType == "Face":
+            plane = shape.findPlane()
+            if plane:
+                end = self.axisEndpoints[self.lockedActivePoint]
+                axis = self.axisDirections[self.lockedActivePoint]
+                normal = plane.Axis
+                d = axis.dot(normal)
+                if abs(d) > 1e-7:
+                    t = plane.Position.sub(end).dot(normal) / d
+                    return end.add(axis * t)
+                if target != self.obj:
+                    # another object's face along the axis gives no level
+                    self.axisParallelFace = True
+                    return None
+                # the edited object's own side face: use the point clicked on it
+        # the snapper gives a working plane point when no object snap was
+        # found, or when snaps are projected on the working plane
+        if point is not None and shape.distToShape(Part.Vertex(point))[0] < 1e-6:
+            return point
+        return App.Vector(info["x"], info["y"], info["z"])
 
     def action(self, arg):
         """Handle the 3D scene events.
@@ -288,6 +331,15 @@ class Trimex(gui_base_original.Modifier):
                 self.snapped = None
             else:
                 self.snapped = self.view.getObjectInfo((arg["Position"][0], arg["Position"][1]))
+            if self.axisSetter is not None:
+                self.point = self._getAxisTarget(self.point, self.snapped)
+                self.snapped = None
+                if self.point is None:
+                    # no object under the cursor: show the unchanged end
+                    self.redraw(self.axisEndpoints[self.lockedActivePoint])
+                    self.ui.setFocus("radius")
+                    gui_tool_utils.redraw3DView()
+                    return
             if self.extrudeMode:
                 dist, ang = (self.extrude(self.shift), None)
             else:
@@ -314,12 +366,37 @@ class Trimex(gui_base_original.Modifier):
         elif arg["Type"] == "SoMouseButtonEvent":
             if (arg["State"] == "DOWN") and (arg["Button"] == "BUTTON1"):
                 cursor = arg["Position"]
+                if self.axisSetter is not None:
+                    if self.point is None:
+                        # clicking empty space does nothing, type a value instead
+                        if self.axisParallelFace:
+                            _wrn(
+                                translate(
+                                    "draft",
+                                    "Trimex: this face is parallel to the edit direction, "
+                                    "pick one of its edges or vertices instead",
+                                )
+                            )
+                        return
+                    end = self.axisEndpoints[self.lockedActivePoint]
+                    if self.newpoint.isEqual(end, 1e-7):
+                        _wrn(
+                            translate(
+                                "draft",
+                                "Trimex: the target is already at this end, " "nothing changed",
+                            )
+                        )
+                        self.finish()
+                        return
                 self.shift = gui_tool_utils.hasMod(arg, gui_tool_utils.get_mod_constrain_key())
                 self.alt = gui_tool_utils.hasMod(arg, gui_tool_utils.get_mod_alt_key())
                 if gui_tool_utils.hasMod(arg, gui_tool_utils.get_mod_snap_key()):
                     self.snapped = None
                 else:
                     self.snapped = self.view.getObjectInfo((cursor[0], cursor[1]))
+                if self.axisSetter is not None:
+                    # self.point is already the target found on mouse move
+                    self.snapped = None
                 self.trimObject()
                 self.finish()
 
@@ -425,11 +502,18 @@ class Trimex(gui_base_original.Modifier):
                 proj = DraftVecUtils.project(chord, perp)
                 self.newpoint = App.Vector.add(point, proj)
             dist = v1.sub(self.newpoint).Length
+            if self.axisSetter is not None:
+                # signed, so the shown value can be typed back: + outward
+                dist = self.newpoint.sub(v1).dot(self.axisDirections[self.lockedActivePoint])
             ghost.p1(self.newpoint)
             ghost.p2(v2)
             if real:
                 if self.force:
-                    ray = self.newpoint.sub(v1)
+                    if self.axisSetter is not None:
+                        # typed values follow the end's outward axis, not the cursor
+                        ray = App.Vector(self.axisDirections[self.lockedActivePoint])
+                    else:
+                        ray = self.newpoint.sub(v1)
                     if ray.Length:
                         ray.multiply(self.force / ray.Length)
                     self.newpoint = App.Vector.add(v1, ray)
@@ -677,6 +761,9 @@ class Trimex(gui_base_original.Modifier):
         when valid x, y, and z have been entered in the input fields.
         """
         self.force = dist
+        if self.point is None and self.axisSetter is not None:
+            # a typed value follows the end's axis, so the end itself will do
+            self.point = self.axisEndpoints[self.lockedActivePoint]
         self.trimObject()
         self.finish()
 
